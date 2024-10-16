@@ -1,0 +1,592 @@
+"""
+Title: Comparative Analysis of Standard Softmax Attention and Kernel Adaptive Attention Module (KAAM) on a Complex Synthetic Dataset
+Author: [Your Name]
+Date: [Current Date]
+Description:
+    This script compares the performance of the standard softmax attention mechanism with the
+    Kernel Adaptive Attention Module (KAAM) using different kernels on a synthetic, complex, and meaningful classification task.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from torch.utils.data import DataLoader, Dataset, random_split
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+    roc_auc_score,
+    roc_curve,
+)
+from tqdm import tqdm
+import random
+
+# Set random seeds for reproducibility
+def set_seed(seed=42):
+    """
+    Set the seed for generating random numbers to ensure reproducibility.
+
+    Args:
+        seed (int): Seed value.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+set_seed(42)
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Generate a complex and meaningful synthetic dataset
+class ComplexSyntheticDataset(Dataset):
+    """
+    Complex Synthetic Dataset for binary classification tasks.
+
+    Generates sequences with specific patterns that determine the labels.
+    """
+
+    def __init__(self, num_samples=2000, seq_length=20, vocab_size=50):
+        self.num_samples = num_samples
+        self.seq_length = seq_length
+        self.vocab_size = vocab_size
+        self.data = []
+        self.labels = []
+        self.patterns = self._generate_patterns()
+        self._generate_data()
+
+    def _generate_patterns(self):
+        """
+        Generates specific patterns to embed in sequences.
+        """
+        # Define some unique patterns (subsequences) that determine the class
+        patterns = [
+            [1, 2, 3],          # Pattern for class 0
+            [4, 5, 6, 7],       # Pattern for class 1
+            [8, 9, 10, 11, 12], # Pattern for class 0
+            [13, 14, 15],       # Pattern for class 1
+        ]
+        return patterns
+
+    def _generate_data(self):
+        """
+        Generates the synthetic data and labels based on patterns.
+        """
+        for _ in range(self.num_samples):
+            seq = torch.randint(1, self.vocab_size, (self.seq_length,)).tolist()
+            label = random.randint(0, 1)
+
+            # Insert a pattern corresponding to the label
+            pattern_choices = [p for idx, p in enumerate(self.patterns) if idx % 2 == label]
+            pattern = random.choice(pattern_choices)
+            insert_pos = random.randint(0, self.seq_length - len(pattern))
+            seq[insert_pos:insert_pos+len(pattern)] = pattern
+
+            self.data.append(torch.tensor(seq, dtype=torch.long))
+            self.labels.append(label)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
+
+def create_data_loader(dataset, batch_size=32, shuffle=True):
+    """
+    Creates a DataLoader for the given dataset.
+
+    Args:
+        dataset (Dataset): The dataset to load.
+        batch_size (int): Number of samples per batch.
+        shuffle (bool): Whether to shuffle the data.
+
+    Returns:
+        DataLoader: The DataLoader for the dataset.
+    """
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+# Standard multi-head attention
+class StandardMultiHeadAttention(nn.Module):
+    """
+    Implements standard multi-head attention with softmax normalization.
+    """
+
+    def __init__(self, d_model, n_heads):
+        super(StandardMultiHeadAttention, self).__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = np.sqrt(self.d_k)
+
+    def forward(self, x, attention_mask=None):
+        batch_size, seq_len, _ = x.size()
+
+        # Linear projections
+        Q = self.q_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k)
+        K = self.k_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k)
+        V = self.v_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k)
+
+        # Transpose to get dimensions (batch_size, n_heads, seq_len, d_k)
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+
+        # Apply attention mask
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            attention_mask = attention_mask.expand(-1, self.n_heads, seq_len, -1)
+            scores = scores.masked_fill(attention_mask == 0, float('-inf'))
+
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_output = torch.matmul(attn_weights, V)
+
+        # Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.out_proj(attn_output)
+
+        return output, attn_weights
+
+# Improved KAAM attention
+class KAAMAttention(nn.Module):
+    """
+    Implements the Kernel Adaptive Attention Module (KAAM) with support for multiple kernels.
+    """
+
+    def __init__(self, d_model, n_heads, kernel_type='rbf', dropout=0.1):
+        super(KAAMAttention, self).__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+        self.kernel_type = kernel_type.lower()
+        self.dropout = nn.Dropout(dropout)
+
+        # Linear projections
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # Learnable parameters for different kernels
+        if self.kernel_type == 'rbf':
+            self.scale_param = nn.Parameter(torch.ones(1))
+        elif self.kernel_type == 'polynomial':
+            self.poly_degree = 2  # Degree can be set as a hyperparameter
+            self.scale_param = nn.Parameter(torch.ones(1))
+        elif self.kernel_type == 'sigmoid':
+            self.alpha = nn.Parameter(torch.ones(1))
+            self.beta = nn.Parameter(torch.zeros(1))
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type}")
+
+    def kernel_function(self, Q, K):
+        """
+        Computes the kernel-based similarity scores between queries and keys.
+
+        Args:
+            Q (Tensor): Query tensor of shape (batch_size, n_heads, seq_len, d_k).
+            K (Tensor): Key tensor of shape (batch_size, n_heads, seq_len, d_k).
+
+        Returns:
+            Tensor: Kernel-based similarity scores of shape (batch_size, n_heads, seq_len, seq_len).
+        """
+        if self.kernel_type == 'rbf':
+            # Gaussian RBF kernel
+            # Efficient computation without explicit tensor expansion
+            Q_norm = Q.pow(2).sum(dim=-1, keepdim=True)  # (batch_size, n_heads, seq_len, 1)
+            K_norm = K.pow(2).sum(dim=-1, keepdim=True).transpose(-2, -1)  # (batch_size, n_heads, 1, seq_len)
+            dist_sq = Q_norm + K_norm - 2 * torch.matmul(Q, K.transpose(-2, -1))
+            kernel_scores = torch.exp(-dist_sq / (2 * self.scale_param ** 2))
+        elif self.kernel_type == 'polynomial':
+            # Polynomial kernel
+            kernel_scores = (torch.matmul(Q, K.transpose(-2, -1)) / self.scale_param + 1) ** self.poly_degree
+        elif self.kernel_type == 'sigmoid':
+            # Sigmoid kernel
+            kernel_scores = torch.tanh(self.alpha * torch.matmul(Q, K.transpose(-2, -1)) + self.beta)
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type}")
+        return kernel_scores
+
+    def forward(self, x, attention_mask=None):
+        """
+        Forward pass for the KAAM attention module.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            attention_mask (Tensor, optional): Attention mask tensor of shape (batch_size, seq_len).
+
+        Returns:
+            Tuple[Tensor, Tensor]: Output tensor and attention weights.
+        """
+        batch_size, seq_len, _ = x.size()
+
+        # Linear projections
+        Q = self.q_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.k_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.v_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+
+        # Kernel-based attention scores
+        kernel_scores = self.kernel_function(Q, K)  # Shape: (batch_size, n_heads, seq_len, seq_len)
+
+        # Apply attention mask
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            attention_mask = attention_mask.expand(-1, self.n_heads, seq_len, -1)
+            kernel_scores = kernel_scores.masked_fill(attention_mask == 0, float('-inf'))
+
+        # Normalize attention scores
+        attn_weights = F.softmax(kernel_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, V)
+
+        # Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.out_proj(attn_output)
+
+        return output, attn_weights
+
+# Transformer encoder layer
+class TransformerEncoderLayer(nn.Module):
+    """
+    A transformer encoder layer with customizable attention mechanism.
+    """
+
+    def __init__(self, d_model, n_heads, dim_feedforward, dropout=0.1, attention_type='standard', kernel_type='rbf'):
+        super(TransformerEncoderLayer, self).__init__()
+        if attention_type == 'standard':
+            self.self_attn = StandardMultiHeadAttention(d_model, n_heads)
+        elif attention_type == 'kaam':
+            self.self_attn = KAAMAttention(d_model, n_heads, kernel_type=kernel_type, dropout=dropout)
+        else:
+            raise ValueError(f"Unknown attention type: {attention_type}")
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = nn.ReLU()
+
+    def forward(self, src, src_mask=None):
+        # Self-attention layer
+        src2, attn_weights = self.self_attn(src, src_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+
+        # Feedforward layer
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src, attn_weights
+
+# Model definition
+class ClassificationModel(nn.Module):
+    """
+    Classification model with customizable attention mechanism.
+    """
+
+    def __init__(self, n_classes, vocab_size, d_model, n_heads, num_layers, dim_feedforward, attention_type='standard', kernel_type='rbf'):
+        super(ClassificationModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(512, d_model)  # Assuming max sequence length of 512
+
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                dim_feedforward=dim_feedforward,
+                attention_type=attention_type,
+                kernel_type=kernel_type
+            ) for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(0.1)
+        self.fc = nn.Linear(d_model, n_classes)
+
+    def forward(self, input_ids, attention_mask):
+        seq_length = input_ids.size(1)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)  # (batch_size, seq_length)
+
+        x = self.embedding(input_ids) + self.position_embedding(position_ids)
+        attn_weights_all = []
+
+        for layer in self.layers:
+            x, attn_weights = layer(x, src_mask=attention_mask)
+            attn_weights_all.append(attn_weights)
+
+        x = x.mean(dim=1)  # Pooling over sequence length
+        x = self.dropout(x)
+        logits = self.fc(x)
+        return logits, attn_weights_all
+
+# Training function
+def train(model, data_loader, criterion, optimizer):
+    """
+    Trains the model for one epoch.
+
+    Args:
+        model (nn.Module): The model to train.
+        data_loader (DataLoader): The DataLoader for the training data.
+        criterion (nn.Module): Loss function.
+        optimizer (Optimizer): Optimizer.
+
+    Returns:
+        tuple: Average loss and accuracy.
+    """
+    model.train()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    for inputs, labels in tqdm(data_loader, desc='Training'):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        attention_mask = (inputs != 0).long()
+
+        optimizer.zero_grad()
+        outputs, _ = model(inputs, attention_mask)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_labels.extend(labels.detach().cpu().numpy())
+
+    avg_loss = total_loss / len(data_loader)
+    acc = accuracy_score(all_labels, all_preds)
+    return avg_loss, acc
+
+# Evaluation function
+def evaluate(model, data_loader, criterion):
+    """
+    Evaluates the model on the validation set.
+
+    Args:
+        model (nn.Module): The model to evaluate.
+        data_loader (DataLoader): The DataLoader for the validation data.
+        criterion (nn.Module): Loss function.
+
+    Returns:
+        tuple: Average loss, accuracy, predictions, labels, probabilities.
+    """
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    with torch.no_grad():
+        for inputs, labels in tqdm(data_loader, desc='Evaluating'):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            attention_mask = (inputs != 0).long()
+
+            outputs, _ = model(inputs, attention_mask)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+
+            probs = F.softmax(outputs, dim=1)[:, 1]  # Probability of class 1
+            preds = outputs.argmax(dim=1)
+            all_probs.extend(probs.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+
+    avg_loss = total_loss / len(data_loader)
+    acc = accuracy_score(all_labels, all_preds)
+    return avg_loss, acc, all_preds, all_labels, all_probs
+
+# Main function to compare attentions
+def compare_attentions():
+    """
+    Compares the performance of standard attention and KAAM with different kernels on a complex synthetic dataset.
+
+    Trains models with standard attention and KAAM using different kernels, evaluates them, and visualizes the attention weights.
+    """
+    # Hyperparameters
+    vocab_size = 50
+    seq_length = 20
+    batch_size = 32
+    d_model = 64
+    n_heads = 4
+    num_layers = 2
+    dim_feedforward = 128
+    num_epochs = 10
+    n_classes = 2
+
+    # Create dataset and dataloader
+    dataset = ComplexSyntheticDataset(num_samples=2000, seq_length=seq_length, vocab_size=vocab_size)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, test_dataset = random_split(dataset, [train_size, val_size])
+    train_loader = create_data_loader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = create_data_loader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # Initialize models
+    models = {}
+    models['standard'] = ClassificationModel(
+        n_classes, vocab_size, d_model, n_heads, num_layers, dim_feedforward, attention_type='standard'
+    ).to(device)
+    kernels = ['rbf', 'polynomial', 'sigmoid']
+    for kernel in kernels:
+        models[kernel] = ClassificationModel(
+            n_classes, vocab_size, d_model, n_heads, num_layers, dim_feedforward, attention_type='kaam', kernel_type=kernel
+        ).to(device)
+
+    # Define loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizers = {}
+    for key in models:
+        optimizers[key] = torch.optim.Adam(models[key].parameters(), lr=1e-3)
+
+    # Containers for metrics
+    metrics = {}
+    for key in models:
+        metrics[key] = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_auc': []}
+
+    # Training and evaluation loop
+    for key in models:
+        print(f"\nTraining Model with {key.upper()} Attention")
+        model = models[key]
+        optimizer = optimizers[key]
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            train_loss, train_acc = train(model, train_loader, criterion, optimizer)
+            val_loss, val_acc, val_preds, val_labels, val_probs = evaluate(model, test_loader, criterion)
+            try:
+                val_auc = roc_auc_score(val_labels, val_probs)
+            except ValueError:
+                val_auc = 0.5  # Handle the case when only one class is present in y_true
+
+            print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc*100:.2f}%")
+            print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc*100:.2f}%, Val AUC: {val_auc:.4f}")
+
+            metrics[key]['train_loss'].append(train_loss)
+            metrics[key]['train_acc'].append(train_acc)
+            metrics[key]['val_loss'].append(val_loss)
+            metrics[key]['val_acc'].append(val_acc)
+            metrics[key]['val_auc'].append(val_auc)
+
+        # Store final predictions for confusion matrix and classification report
+        metrics[key]['val_preds'] = val_preds
+        metrics[key]['val_labels'] = val_labels
+        metrics[key]['val_probs'] = val_probs
+
+    # Plot training and validation loss
+    plt.figure(figsize=(10, 6))
+    for key in models:
+        plt.plot(metrics[key]['train_loss'], label=f'{key.capitalize()} Train Loss')
+        plt.plot(metrics[key]['val_loss'], label=f'{key.capitalize()} Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Comparison')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot training and validation accuracy
+    plt.figure(figsize=(10, 6))
+    for key in models:
+        plt.plot([acc * 100 for acc in metrics[key]['train_acc']], label=f'{key.capitalize()} Train Acc')
+        plt.plot([acc * 100 for acc in metrics[key]['val_acc']], label=f'{key.capitalize()} Val Acc')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Training and Validation Accuracy Comparison')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot validation AUC
+    plt.figure(figsize=(10, 6))
+    for key in models:
+        plt.plot(metrics[key]['val_auc'], label=f'{key.capitalize()} Val AUC')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUC Score')
+    plt.title('Validation AUC Score Comparison')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Confusion matrices and classification reports
+    for key in models:
+        print(f"\nClassification Report for {key.capitalize()} Attention Model:")
+        print(classification_report(metrics[key]['val_labels'], metrics[key]['val_preds'], digits=4))
+
+        cm = confusion_matrix(metrics[key]['val_labels'], metrics[key]['val_preds'])
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title(f'Confusion Matrix - {key.capitalize()} Attention')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.tight_layout()
+        plt.show()
+
+    # ROC Curves
+    plt.figure(figsize=(10, 6))
+    for key in models:
+        try:
+            fpr, tpr, _ = roc_curve(metrics[key]['val_labels'], metrics[key]['val_probs'])
+            plt.plot(fpr, tpr, label=f'{key.capitalize()} (AUC = {metrics[key]["val_auc"][-1]:.4f})')
+        except ValueError:
+            continue  # Skip if ROC cannot be computed
+    plt.plot([0, 1], [0, 1], 'k--')  # Diagonal line
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve Comparison')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Visualize attention weights for a sample input
+    sample_input, _ = test_dataset[0]
+    sample_input = sample_input.unsqueeze(0)  # Add batch dimension
+    attention_mask = (sample_input != 0).long().to(device)
+
+    fig, axs = plt.subplots(1, len(models), figsize=(18, 5))
+    for idx, key in enumerate(models):
+        model = models[key]
+        model.eval()
+        with torch.no_grad():
+            _, attn_weights_all = model(sample_input.to(device), attention_mask)
+        attn_weights = attn_weights_all[0][0][0]  # First layer, first head
+        attn_weights = attn_weights.detach().cpu().numpy()
+        sns.heatmap(attn_weights, ax=axs[idx], cmap='viridis', annot=False)
+        axs[idx].set_title(f'{key.capitalize()} Attention Weights (Head 1)')
+        axs[idx].set_xlabel('Key Positions')
+        axs[idx].set_ylabel('Query Positions')
+    plt.tight_layout()
+    plt.show()
+
+    # Discussion of Results
+    print("\nDiscussion:")
+    print("The above results provide a comparison between standard softmax attention and KAAM with different kernels on a complex synthetic dataset.")
+    print("The dataset was designed with specific patterns embedded in sequences that determine the class labels.")
+    print("By examining the training and validation metrics, we can evaluate how effectively each attention mechanism captures these patterns.")
+    print("Attention weight visualizations offer insights into how each model focuses on different parts of the input sequence.")
+    print("Further experiments could involve adjusting the complexity of the patterns, tuning hyperparameters, or exploring additional kernels.")
+
+if __name__ == "__main__":
+    compare_attentions()
