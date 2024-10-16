@@ -1,0 +1,104 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class KAAMAttention(nn.Module):
+    """
+    Implements the Kernel Adaptive Attention Module (KAAM) with support for multiple kernels.
+    """
+    def __init__(self, d_model, n_heads, kernel_type='rbf', dropout=0.1):
+        super(KAAMAttention, self).__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+        self.kernel_type = kernel_type.lower()
+        self.dropout = nn.Dropout(dropout)
+    
+        # Linear projections
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+    
+        # Learnable parameters for different kernels
+        if self.kernel_type == 'rbf':
+            self.scale_param = nn.Parameter(torch.ones(1))
+        elif self.kernel_type == 'polynomial':
+            self.poly_degree = 2  # Degree can be set as a hyperparameter
+            self.scale_param = nn.Parameter(torch.ones(1))
+        elif self.kernel_type == 'sigmoid':
+            self.alpha = nn.Parameter(torch.ones(1))
+            self.beta = nn.Parameter(torch.zeros(1))
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type}")
+    
+    def kernel_function(self, Q, K):
+        """
+        Computes the kernel-based similarity scores between queries and keys.
+    
+        Args:
+            Q (Tensor): Query tensor of shape (batch_size, n_heads, seq_len, d_k).
+            K (Tensor): Key tensor of shape (batch_size, n_heads, seq_len, d_k).
+    
+        Returns:
+            Tensor: Kernel-based similarity scores of shape (batch_size, n_heads, seq_len, seq_len).
+        """
+        if self.kernel_type == 'rbf':
+            # Gaussian RBF kernel
+            # Efficient computation without explicit tensor expansion
+            Q_norm = Q.pow(2).sum(dim=-1, keepdim=True)  # (batch_size, n_heads, seq_len, 1)
+            K_norm = K.pow(2).sum(dim=-1, keepdim=True).transpose(-2, -1)  # (batch_size, n_heads, 1, seq_len)
+            dist_sq = Q_norm + K_norm - 2 * torch.matmul(Q, K.transpose(-2, -1))
+            kernel_scores = torch.exp(-dist_sq / (2 * self.scale_param ** 2))
+        elif self.kernel_type == 'polynomial':
+            # Polynomial kernel
+            kernel_scores = (torch.matmul(Q, K.transpose(-2, -1)) / self.scale_param + 1) ** self.poly_degree
+        elif self.kernel_type == 'sigmoid':
+            # Sigmoid kernel
+            kernel_scores = torch.tanh(self.alpha * torch.matmul(Q, K.transpose(-2, -1)) + self.beta)
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type}")
+        return kernel_scores
+    
+    def forward(self, x, attention_mask=None):
+        """
+        Forward pass for the KAAM attention module.
+    
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            attention_mask (Tensor, optional): Attention mask tensor of shape (batch_size, seq_len).
+    
+        Returns:
+            Tuple[Tensor, Tensor]: Output tensor and attention weights.
+        """
+        batch_size, seq_len, _ = x.size()
+    
+        # Linear projections
+        Q = self.q_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.k_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.v_linear(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+    
+        # Kernel-based attention scores
+        kernel_scores = self.kernel_function(Q, K)  # Shape: (batch_size, n_heads, seq_len, seq_len)
+    
+        # Apply attention mask
+        if attention_mask is not None:
+            # attention_mask shape: (batch_size, seq_len)
+            # Expand mask to match kernel_scores dimensions
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            attention_mask = attention_mask.expand(-1, self.n_heads, seq_len, -1)
+            kernel_scores = kernel_scores.masked_fill(attention_mask == 0, float('-inf'))
+    
+        # Normalize attention scores
+        attn_weights = F.softmax(kernel_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+    
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, V)
+    
+        # Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.out_proj(attn_output)
+    
+        return output, attn_weights
